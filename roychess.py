@@ -524,7 +524,7 @@ async def move(context): #######################################################
         new_game.headers = game.headers
         bot.games[game_id] = str(new_game)
         if this_board.is_game_over():
-            new_game["Result"] = this_board.result()
+            new_game.headers["Result"] = this_board.result()
             bot.history[game_id] = str(new_game)
             del bot.games[game_id]
     except Exception:
