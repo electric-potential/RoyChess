@@ -1,5 +1,5 @@
 """
-this file has been updated on 11/05/2020 at 03:37
+this file has been updated on 12/05/2020 at 14:45
 """
 
 from __future__ import unicode_literals
@@ -89,7 +89,6 @@ async def on_ready(): ##########################################################
     except Exception:
         bot.games = {}
         f = open("games.json", "w")
-        json.dump(bot.games, f)
         f.close()
     try:
         f = open("history.json", "r")
@@ -98,7 +97,6 @@ async def on_ready(): ##########################################################
     except Exception:
         bot.history = {}
         f = open("history.json", "w")
-        json.dump(bot.history, f)
         f.close()
     try:
         f = open("profiles.json", "r")
@@ -107,14 +105,13 @@ async def on_ready(): ##########################################################
     except Exception:
         bot.profiles = {}
         f = open("profiles.json", "w")
-        json.dump(bot.profiles, f)
         f.close()
 
     while True:
         await asyncio.sleep(600) # every 10 minutes
         to_delete = []
         for i in bot.games.keys():
-            game = io.StringIO(bot.games[i])
+            game = chess.pgn.read_game(io.StringIO(bot.games[i]))
             if time.time() - float(game.headers["Time"]) >= 86400 and game.headers["Result"] == "": # one day and game not over
                 try:
                     mem1 = None
@@ -254,7 +251,7 @@ async def create_game(context, *args): #########################################
         if mem1.bot or mem2.bot:
             raise Exception
         for i in bot.games.keys():
-            game = chess.pgn.read_game(io.StringIO(bot.games.keys[i]))
+            game = chess.pgn.read_game(io.StringIO(bot.games[i]))
             if (str(mem1.id) == game.headers["White"] and str(mem2.id) == game.headers["Black"] and game.headers["Result"] == "") or (str(mem1.id) == game.headers["Black"] and str(mem2.id) == game.headers["White"] and game.headers["Result"] == ""):
                 err = "game between users already exists with ID "+i
                 raise Exception
@@ -325,19 +322,18 @@ async def board(context): ######################################################
             raise Exception
         game_id = context.message.content.split()[1]
         this_board = chess.Board()
-        last_move = None
-        mem1 = None
-        mem2 = None
-        game = None
         err = "game ID not found"
-        game = io.StringIO(bot.games[game_id])
+        try:
+            game = chess.pgn.read_game(io.StringIO(bot.games[game_id]))
+        except Exception:
+            game = chess.pgn.read_game(io.StringIO(bot.history[game_id]))
         for move in game.mainline_moves():
             this_board.push(move)
         err = "not all players could be found"
         conv = MemberConverter()
-        mem1 = game.headers["White"]
-        mem2 = game.headers["Black"]
-        clr = 254*(1-(len(game[-1])%2)) # for some reason, discord does'nt like (255,255,255), use (254,254,254) for white instead
+        mem1 = await conv.convert(context, game.headers["White"])
+        mem2 = await conv.convert(context, game.headers["Black"])
+        clr = 254*(1-(len(this_board.move_stack)%2)) # for some reason, discord does'nt like (255,255,255), use (254,254,254) for white instead
         if game.headers["Result"] == "":
             emb = discord.Embed(
                                 title = "view board",
@@ -376,7 +372,7 @@ async def board(context): ######################################################
                          )
         emb.add_field(
                       name = "last move:",
-                      value = last_move,
+                      value = game.headers["Move"],
                       inline = False
                      )
         emb.add_field(
@@ -408,7 +404,7 @@ async def move(context): #######################################################
             raise Exception
         this_board = chess.Board()
         err = "game ID not found"
-        game = io.StringIO(bot.games[game_id])
+        game = chess.pgn.read_game(io.StringIO(bot.games[game_id]))
         for move in game.mainline_moves():
             this_board.push(move)
         err = "you are not a player in this game"
@@ -418,11 +414,11 @@ async def move(context): #######################################################
         if game.headers["Result"] != "": # not needed after history implemented
             raise Exception
         err = "it is not your turn"
-        if (len(this_board.move_stack)%2 == 0 and str(context.message.author.id) == game.headers["Black"]) or (len(this_board.move_stack)%2 == 1 and str(context.message.author.id) == game.headers["White"]):
+        if ((len(this_board.move_stack)%2 == 0 and str(context.message.author.id) == game.headers["Black"]) or (len(this_board.move_stack)%2 == 1 and str(context.message.author.id) == game.headers["White"])) and (game.headers["White"] != game.headers["Black"]):
             raise Exception
-        mem2 = None
+        err = "not all players could be found"
         conv = MemberConverter()
-        mem1 = await conv.convert(context, context.message.author.id)
+        mem1 = await conv.convert(context, str(context.message.author.id))
         if str(context.message.author.id) == game.headers["White"]:
             mem2 = await conv.convert(context, game.headers["Black"])
         else:
@@ -461,29 +457,14 @@ async def move(context): #######################################################
                 await mem2.send(msg)
             except Exception:
                 pass
+            return
         else:
             err = "invalid UCI string "+context.message.content.split()[2]
             move = chess.Move.from_uci(context.message.content.split()[2])
         if move not in this_board.legal_moves:
-            emb = discord.Embed(
-                                title = "error making move",
-                                description = "invalid move "+context.message.content.split()[2],
-                                color = discord.Color.from_rgb(255,0,0)
-                                )
-            emb.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
-            try:
-                await context.message.channel.send(embed=emb)
-            except Exception:
-                pass
-            return
+            err = "invalid move "+context.message.content.split()[2]
+            raise Exception
         this_board.push(move)
-        mem1 = None
-        mem2 = None
-        for mem in bot.get_all_members():
-            if mem.id == context.message.author.id:
-                mem1 = mem
-            if (str(mem.id) == game.headers["Black"] and str(context.message.author.id) == game.headers["White"]) or (str(mem.id) == game.headers["White"] and str(context.message.author.id) == game.headers["Black"]):
-                mem2 = mem
         if this_board.is_game_over():
             res = this_board.result().split("-")
             if res[0] == "1/2":
@@ -519,42 +500,33 @@ async def move(context): #######################################################
                                 color = discord.Color.from_rgb(0,255,0)
                                 )
             emb.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
-            emb3 = discord.Embed(
-                                title = "your turn",
-                                description = "it is your turn to play the board with game ID "+game_id,
-                                color = discord.Color.from_rgb(0,255,0)
-                                )
+            if this_board.is_check():
+                emb3 = discord.Embed(
+                                    title = "your turn",
+                                    description = "it is your turn to play the board with game ID "+game_id+", you are in check",
+                                    color = discord.Color.from_rgb(0,255,0)
+                                    )
+            else:
+                emb3 = discord.Embed(
+                                    title = "your turn",
+                                    description = "it is your turn to play the board with game ID "+game_id,
+                                    color = discord.Color.from_rgb(0,255,0)
+                                    )
             emb3.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
         msg = board_to_string(this_board)
-        try:
-            await context.message.channel.send(embed=emb)
-            await context.message.channel.send(msg)
-            if mem1.id == context.message.author.id:
-                await mem2.send(embed=emb3)
-                await mem2.send(msg)
-            else:
-                await mem1.send(embed=emb3)
-                await mem1.send(msg)
-            game.headers["Move"] = context.message.content.split()[2]
-            new_game = chess.pgn.Game().from_board(this_board)
-            new_game.headers = game.headers
-            bot.games[game_id] = str(new_game)
-            if this_board.is_game_over():
-                new_game["Result"] = this_board.result()
-                bot.history[game_id] = bot.games[game_id]
-                del bot.games[game_id]
-        except Exception:
-            emb = discord.Embed(
-                                title = "error making move",
-                                description = "not all players could be contacted, the move was aborted",
-                                color = discord.Color.from_rgb(255,0,0)
-                                )
-            emb.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
-            try:
-                await context.message.channel.send(embed=emb)
-            except Exception:
-                return
-        return
+        err = "not all players could be contacted, the move was aborted"
+        await context.message.channel.send(embed=emb)
+        await context.message.channel.send(msg)
+        await mem2.send(embed=emb3)
+        await mem2.send(msg)
+        game.headers["Move"] = context.message.content.split()[2]
+        new_game = chess.pgn.Game().from_board(this_board)
+        new_game.headers = game.headers
+        bot.games[game_id] = str(new_game)
+        if this_board.is_game_over():
+            new_game["Result"] = this_board.result()
+            bot.history[game_id] = str(new_game)
+            del bot.games[game_id]
     except Exception:
         try:
             await context.message.channel.send(embed=error_embed(bot, "error making move", err))
@@ -570,7 +542,7 @@ async def info(context): #######################################################
                         )
     emb.add_field(
                   name = "bot version:",
-                  value = "1.1", # increment by 0.1 when pushing a new release
+                  value = "3", # increment by 1 when pushing a new release
                   inline = True
                  )
     emb.add_field(
@@ -677,9 +649,13 @@ async def force_delete(context): ###############################################
                                 )
             emb.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
             bot.games = {}
+            bot.history = {}
             bot.saving = True
             f = open("games.json", "w")
-            json.dump({}, f)
+            json.dump(bot.games, f)
+            f.close()
+            f = open("history.json", "w")
+            json.dump(bot.history, f)
             f.close()
             bot.saving = False
             try:
