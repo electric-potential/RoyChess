@@ -1,25 +1,57 @@
-"""
-this file has been updated on 12/05/2020 at 14:45
-"""
-
-from __future__ import unicode_literals
+from __future__ import unicode_literals # for handling unicode in messages
 import discord
+from discord.ext import commands as cmds # command interface
+from discord.ext import tasks # for auto-save
 from discord.ext.commands import Bot
 from discord.ext.commands import CommandNotFound
 from discord.ext.commands import MemberConverter
-import json
+import json # database
 import time
-import datetime
 import asyncio
+import traceback
+
+import setup # local file
 
 import chess
 import chess.pgn
-import io
+import io # reading PGN strings
 
-prefix = 'rc.'
-description = 'chess bot'
-bot = Bot(command_prefix=prefix, description=description)
-token = '' # input your own token here if you have your own testing suite
+"""
+TODO:
+
+    priority:
+        [x] finish docstring for create_game command
+        [x] port and refactor info command
+        [x] implement accept_invite command
+        [x] implement decline_invite command
+        [x] implement revoke_invite command
+        [x] change "f = open()" statements to "with open() as f" statements
+        [x] port and refactor move command
+        [x] port and refactor board command
+        [x] implement auto-save
+
+    bonus:
+        [ ] iron out bugs that may have arisen from refactoring
+        [ ] make an embed color chart to organize responses
+        [ ] escape markdown on converting member to string
+        [ ] possibility to offer draw on your turn
+        [ ] remove unused imports
+        [ ] implement changelog command
+        [ ] implement an owner only force_save command
+        [ ] refactor O(n) code in create_game (O(log(n)) is acceptable, maybe binary search?)
+        [ ] make multiple different locks to access different games (indexed by the last digit of game ID)
+        [ ] turn bot into a cog
+        [ ] implement profiles
+        [ ] custom chess assets
+        [ ] statistics.json file for logging bot usage over time
+        [ ] make board_to_string docstring and independent of the global bot variable 
+"""
+
+lock = asyncio.Lock()
+intents = discord.Intents.default()
+intents.members = True
+bot = Bot(command_prefix=setup.prefix, description=setup.description, intents=intents)
+bot.remove_command("help") # we might define this later
 
 def board_to_string(board):
     natives = {8: "eight", 7: "seven", 6: "six", 5: "five", 4: "four", 3: "three", 2: "two", 1: "one", "a": "regional_indicator_a", "b": "regional_indicator_b", "c": "regional_indicator_c", "d": "regional_indicator_d", "e": "regional_indicator_e", "f": "regional_indicator_f", "g": "regional_indicator_g", "h": "regional_indicator_h"}
@@ -49,658 +81,925 @@ def board_to_string(board):
         msg += "\n"
     return msg
 
-def new_game(id1, id2, dtime, ttime): # make sure you pass in all arguments as strings
+def other_embed(title, description, rgb=[255,0,0]):
+    if description is not None:
+        emb = discord.Embed(
+                            title = title,
+                            description = description,
+                            color = discord.Color.from_rgb(rgb[0],rgb[1],rgb[2])
+                            )
+    else:
+        emb = discord.Embed(
+                            title = title,
+                            color = discord.Color.from_rgb(rgb[0],rgb[1],rgb[2])
+                            )
+    emb.set_footer(text=str(bot.owner), icon_url=bot.owner.avatar_url)
+    return emb
+
+def error_embed(e):
+    return other_embed("Error", discord.utils.escape_markdown(str(type(e).__name__)+": "+str(e)))
+
+async def safe_send_embed(chan, emb, msg=None, file=None):
+    try:
+        await chan.send(msg, embed=emb, file=file)
+        return 0
+    except Exception as e:
+        return -1
+
+def new_game(id1, id2, ttime): # make sure you pass in all arguments as strings
     game = chess.pgn.Game()
-    game.headers["Event"] = "RoyChess standard match"
+    game.headers["Event"] = "RoyChess match"
     game.headers["Site"] = "RoyChess"
     game.headers["Round"] = "0"
-    game.headers["Date"] = dtime
-    game.headers["Time"] = ttime
+    game.headers["First_Timestamp"] = ttime # string, not float
+    game.headers["Last_Timestamp"] = ttime # string, not float
     game.headers["White"] = id1
     game.headers["Black"] = id2
+    game.headers["Started"] = "False"
     game.headers["Result"] = ""
     game.headers["Move"] = "None"
     return game
 
-def error_embed(b, t, msg):
-    emb = discord.Embed(
-                        title = t,
-                        description = msg,
-                        color = discord.Color.from_rgb(255,0,0)
-                        )
-    emb.set_footer(text=str(b.me), icon_url=b.me.avatar_url)
-    return emb
-
 @bot.event
-async def on_ready(): ####################################################################################################################################
-    print('logged in') # offload the loop to another function eventually
-    print('discord version : '+str(discord.__version__))
-    await bot.change_presence(status=discord.Status.online, activity=discord.Game(name=prefix+"commands"))
-    bot.me = None # change this to find yourself
-    bot.home = None # home server
-    bot.saving = False
-    bot.chess_emojis = {}
-    for emoji in bot.home.emojis: # home server should have all chess piece assets
-        bot.chess_emojis[emoji.name] = emoji
+async def on_ready():
+    await lock.acquire()
     try:
-        f = open("games.json", "r")
-        bot.games = json.load(f)
-        f.close()
-    except Exception:
-        bot.games = {}
-        f = open("games.json", "w")
-        f.close()
-    try:
-        f = open("history.json", "r")
-        bot.history = json.load(f)
-        f.close()
-    except Exception:
-        bot.history = {}
-        f = open("history.json", "w")
-        f.close()
-    try:
-        f = open("profiles.json", "r")
-        bot.profiles = json.load(f)
-        f.close()
-    except Exception:
-        bot.profiles = {}
-        f = open("profiles.json", "w")
-        f.close()
+        info = await bot.application_info() # easier way of getting owner
+        bot.owner = info.owner
+        bot.home = discord.utils.get(bot.guilds, id=setup.home_id) # home server
+        bot.chess_emojis = {}
+        for emoji in bot.home.emojis: # home server should have all chess piece assets
+            bot.chess_emojis[emoji.name] = emoji
+        try:
+            with open(setup.games_file, "r") as f:
+                bot.games = json.load(f)
+            print("games loaded from file")
+        except Exception:
+            bot.games = {}
+            with open(setup.games_file, "w") as f:
+                json.dump({}, f)
+            print("games failed to load from file")
+        try:
+            with open(setup.history_file, "r") as f:
+                bot.history = json.load(f)
+            print("history loaded from file")
+        except Exception:
+            bot.history = {}
+            with open(setup.history_file, "w") as f:
+                json.dump({}, f)
+            print("history failed to load from file")
+        try:
+            with open(setup.profiles_file, "r") as f:
+                bot.profiles = json.load(f)
+            print("profiles loaded from file")
+        except Exception:
+            bot.profiles = {}
+            with open(setup.profiles_file, "w") as f:
+                json.dump({}, f)
+            print("profiles failed to load from file")
+        await bot.change_presence(status=discord.Status.online, activity=discord.Game(name=bot.command_prefix+"commands"))
+        print('logged in')
+        print('discord version : '+str(discord.__version__))
+        print('owner: '+str(bot.owner))
+        autosave.start()
+    except Exception as e:
+        print("something went wrong during initialization, exception printed below")
+        traceback.print_exception(type(e), e, e.__traceback__)
+    finally:
+        lock.release()
 
-    while True:
-        await asyncio.sleep(600) # every 10 minutes
+@tasks.loop(seconds=setup.autosave)
+async def autosave():
+    await lock.acquire()
+    try:
+        now = int(time.time())
         to_delete = []
-        for i in bot.games.keys():
-            game = chess.pgn.read_game(io.StringIO(bot.games[i]))
-            if time.time() - float(game.headers["Time"]) >= 86400 and game.headers["Result"] == "": # one day and game not over
-                try:
-                    mem1 = None
-                    mem2 = None
-                    last_move = game.headers["Move"]
-                    for mem in bot.get_all_members():
-                        if str(mem.id) == game.headers["White"]:
-                            mem1 = mem
-                        if str(mem.id) == game.headers["Black"]:
-                            mem2 = mem
-                    if mem1 == None or mem2 == None:
-                        raise Exception
-                    emb = discord.Embed(
-                                        title = "game timed out",
-                                        description = "game lasted longer than one day, assuming stale and deleting, additional game info attached",
-                                        color = discord.Color.from_rgb(255,0,0)
-                                        )
-                    emb.add_field(
-                                  name = "game ID:",
-                                  value = i,
-                                  inline = False
-                                 )
-                    emb.add_field(
-                                  name = "white:",
-                                  value = str(mem1)+"\n"+str(mem1.id),
-                                  inline = False
-                                 )
-                    emb.add_field(
-                                  name = "black:",
-                                  value = str(mem2)+"\n"+str(mem2.id),
-                                  inline = False
-                                 )
-                    emb.add_field(
-                                  name = "start time:",
-                                  value = game.headers["Date"],
-                                  inline = False
-                                 )
-                    emb.add_field(
-                                  name = "turn:",
-                                  value = {0: "white", 1: "black"}[len(list(game.mainline_moves()))%2],
-                                  inline = False
-                                 )
-                    emb.add_field(
-                                  name = "last move:",
-                                  value = last_move,
-                                  inline = False
-                                 )
-                    emb.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
-                    await mem1.send(embed=emb)
-                    if mem1.id != mem2.id:
-                        await mem2.send(embed=emb)
-                except Exception:
-                    pass
-                to_delete.append(i)
-        for i in to_delete:
-            del bot.games[i]
-        if not bot.saving:
-            bot.saving = True
-            f = open("games.json", "w")
-            json.dump(bot.games, f) # save every 10 minutes just in case bot goes down
-            f.close()
-            f = open("history.json", "w")
-            json.dump(bot.history, f) # save every 10 minutes just in case bot goes down
-            f.close()
-            f = open("users.json", "w")
-            json.dump(bot.profiles, f) # save every 10 minutes just in case bot goes down
-            f.close()
-            bot.saving = False # comedy comes in threes
-
-@bot.command(pass_context=True)
-async def commands(context): ####################################################################################################################################
-    emb = discord.Embed(
-                        title = "commands",
-                        color = discord.Color.from_rgb(127,127,127)
-                        )
-    emb.add_field(
-                  name = prefix+"info",
-                  value = "displays general information about the bot",
-                  inline = False
-                 )
-    emb.add_field(
-                  name = prefix+"commands",
-                  value = "displays this list of commands",
-                  inline = False
-                 )
-    emb.add_field(
-                  name = prefix+"invite",
-                  value = "shares the invite URL to add RoyChess to other servers",
-                  inline = False
-                 )
-    emb.add_field(
-                  name = prefix+"create_game <username, user ID, or mention>",
-                  value = "creates a new game between the user that called the command and the user specified",
-                  inline = False
-                 )
-    emb.add_field(
-                  name = prefix+"board <game ID>",
-                  value = "displays information about a game board with the specified game ID",
-                  inline = False
-                 )
-    emb.add_field(
-                  name = prefix+"move <game ID> <UCI string>",
-                  value = "makes a move encoded by the specified UCI string on the board specified by the game ID",
-                  inline = False
-                 )
-    emb.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
-    try:
-        await context.message.channel.send(embed=emb)
-    except Exception:
-        pass
-    return
-
-@bot.command(pass_context=True)
-async def invite(context): ####################################################################################################################################
-    emb = discord.Embed(
-                        title = "invite",
-                        description = "[invite link](https://discordapp.com/oauth2/authorize?&client_id="+str(bot.user.id)+"&scope=bot&permissions=0)",
-                        color = discord.Color.from_rgb(127,127,127)
-                        )
-    emb.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
-    try:
-        await context.message.channel.send(embed=emb)
-    except Exception:
-        pass
-
-@bot.command(pass_context=True)
-async def create_game(context, *args): ####################################################################################################################################
-    try:
-        err = "insufficient arguments to command"
-        if len(args) != 1:
-            raise Exception
-        err = "users not found"
-        mem1 = context.message.author # may not be discord.Member, potentially discord.User
-        conv = MemberConverter() # need to instantiate new object, otherwise convert can't pass in self
-        mem2 = await conv.convert(context, args[0]) # much cleaner than before, and much more native
-        err = "cannot start a game with a bot user"
-        if mem1.bot or mem2.bot:
-            raise Exception
-        for i in bot.games.keys():
-            game = chess.pgn.read_game(io.StringIO(bot.games[i]))
-            if (str(mem1.id) == game.headers["White"] and str(mem2.id) == game.headers["Black"] and game.headers["Result"] == "") or (str(mem1.id) == game.headers["Black"] and str(mem2.id) == game.headers["White"] and game.headers["Result"] == ""):
-                err = "game between users already exists with ID "+i
-                raise Exception
-        game_id = 1
-        while str(game_id) in bot.games.keys() or str(game_id) in bot.history.keys():
-            game_id += 1
-        game_id = str(game_id)
-        dtime = ("0"*(2-len(str(datetime.datetime.now().day))))+str(datetime.datetime.now().day)+"/"+("0"*(2-len(str(datetime.datetime.now().month))))+str(datetime.datetime.now().month)+"/"+str(datetime.datetime.now().year)+" at "+("0"*(2-len(str(datetime.datetime.now().hour))))+str(datetime.datetime.now().hour)+":"+("0"*(2-len(str(datetime.datetime.now().minute))))+str(datetime.datetime.now().minute)+" EST"
-        emb = discord.Embed(
-                            title = "game created",
-                            color = discord.Color.from_rgb(0,255,0)
-                            )
-        emb.add_field(
-                      name = "game ID:",
-                      value = game_id,
-                      inline = False
-                     )
-        emb.add_field(
-                      name = "white:",
-                      value = str(mem1)+"\n"+str(mem1.id),
-                      inline = False
-                     )
-        emb.add_field(
-                      name = "black:",
-                      value = str(mem2)+"\n"+str(mem2.id),
-                      inline = False
-                     )
-        emb.add_field(
-                      name = "start time:",
-                      value = dtime,
-                      inline = False
-                     )
-        emb.add_field(
-                      name = "turn:",
-                      value = "white",
-                      inline = False
-                     )
-        emb.add_field(
-                      name = "last move:",
-                      value = "None",
-                      inline = False
-                     )
-        emb.add_field(
-                      name = "game conclusion:",
-                      value = "still in progress",
-                      inline = False
-                     )
-        msg = board_to_string(chess.Board())
-        emb.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
-        err = "could not contact all players"
-        await context.message.channel.send(embed=emb)
-        await context.message.channel.send(msg)
-        await mem2.send(embed=emb)
-        await mem2.send(msg)
-        bot.games[game_id] = str(new_game(str(mem1.id), str(mem2.id), dtime, str(time.time())))
-    except Exception: # handles embed error messages using previously defined command, cleans control flow up
-        try:
-            await context.message.channel.send(embed=error_embed(bot, "error creating game", err))
-        except Exception:
-            pass
-    return
-
-@bot.command(pass_context=True)
-async def board(context): ####################################################################################################################################
-    try:
-        err = "insufficient arguments to command"
-        if len(context.message.content.split()) != 2: # splitting message content is archaic, switch to argument parsing eventually...
-            raise Exception
-        game_id = context.message.content.split()[1]
-        this_board = chess.Board()
-        err = "game ID not found"
-        try:
+        for game_id in bot.games:
             game = chess.pgn.read_game(io.StringIO(bot.games[game_id]))
-        except Exception:
-            game = chess.pgn.read_game(io.StringIO(bot.history[game_id]))
-        for move in game.mainline_moves():
-            this_board.push(move)
-        err = "not all players could be found"
-        conv = MemberConverter()
-        mem1 = await conv.convert(context, game.headers["White"])
-        mem2 = await conv.convert(context, game.headers["Black"])
-        clr = 254*(1-(len(this_board.move_stack)%2)) # for some reason, discord does'nt like (255,255,255), use (254,254,254) for white instead
-        if game.headers["Result"] == "":
-            emb = discord.Embed(
-                                title = "view board",
-                                color = discord.Color.from_rgb(clr,clr,clr)
-                                )
-        else:
-            emb = discord.Embed(
-                                title = "view board",
-                                color = discord.Color.from_rgb(0,0,255)
-                                )
-        emb.add_field(
-                      name = "game ID:",
-                      value = game_id,
-                      inline = False
-                     )
-        emb.add_field(
-                      name = "white:",
-                      value = str(mem1)+"\n"+str(mem1.id),
-                      inline = False
-                     )
-        emb.add_field(
-                      name = "black:",
-                      value = str(mem2)+"\n"+str(mem2.id),
-                      inline = False
-                     )
-        emb.add_field(
-                      name = "start time:",
-                      value = game.headers["Date"],
-                      inline = False
-                     )
-        if game.headers["Result"] == "":
-            emb.add_field(
-                          name = "turn:",
-                          value = {0: "white", 1: "black"}[len(this_board.move_stack)%2],
-                          inline = False
-                         )
-        emb.add_field(
-                      name = "last move:",
-                      value = game.headers["Move"],
-                      inline = False
-                     )
-        emb.add_field(
-                      name = "game conclusion:",
-                      value = {"" : "still in progress", "1-0" : "white victory", "0-1" : "black victory", "1/2-1/2" : "draw or stalemate", "r-0" : "white resignation", "0-r" : "black resignation"}[game.headers["Result"]],
-                      inline = False
-                     )
-        emb.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
-        msg = board_to_string(this_board)
-        err = "could not send message to channel"
-        await context.message.channel.send(embed=emb)
-        await context.message.channel.send(msg)
-    except Exception:
+            if now - int(game.headers["First_Timestamp"]) >= setup.timeout and game.headers["Result"] == "": # timeout criterion
+                to_delete += [game_id]
+                # can't use MemberConverter because task loops have no invocation context (is get_user optimal here?)
+                mem1 = bot.get_user(int(game.headers["White"]))
+                mem2 = bot.get_user(int(game.headers["Black"]))
+                emb = other_embed("Game Timed Out", "The following game has timed out and is being deleted.", [127, 0, 255])
+                emb.add_field(
+                              name = "Game ID",
+                              value = game_id,
+                              inline = True
+                             )
+                emb.add_field(
+                              name = "White",
+                              value = str(mem1),
+                              inline = True
+                             )
+                emb.add_field(
+                              name = "Black",
+                              value = str(mem2),
+                              inline = True
+                             )
+                emb.add_field(
+                              name = "Invitation Timestamp",
+                              value = time.strftime("%A, %B %d, %Y at %H:%M:%S "+setup.timezone, time.localtime(int(game.headers["First_Timestamp"]))),
+                              inline = True
+                             )
+                if game.headers["Started"] == "False":
+                    b = None
+                    emb.add_field(
+                                  name = "Invitation Status",
+                                  value = "Pending",
+                                  inline = True
+                                 )
+                else:
+                    b = chess.Board()
+                    for move in game.mainline_moves():
+                        b.push(move)
+                    b = board_to_string(b)
+                    emb.add_field(
+                                  name = "Recent Timestamp",
+                                  value = time.strftime("%A, %B %d, %Y at %H:%M:%S "+setup.timezone, time.localtime(int(game.headers["Last_Timestamp"]))),
+                                  inline = True
+                                  )
+                    emb.add_field(
+                                  name = "Turn",
+                                  value = {0: "White ("+str(mem1)+")", 1: "Black ("+str(mem2)+")"}[len(list(game.mainline_moves()))%2],
+                                  inline = True
+                                  )
+                    emb.add_field(
+                                  name = "Last Move",
+                                  value = game.headers["Move"],
+                                  inline = True
+                                 )
+                await safe_send_embed(mem1, emb, b)
+                await safe_send_embed(mem2, emb, b)
+        for game_id in to_delete:
+            del bot.games[game_id]
         try:
-            await context.message.channel.send(embed=error_embed(bot, "error viewing board", err))
+            with open(setup.games_file, "w") as f:
+                json.dump(bot.games, f)
         except Exception:
-            pass
-    return
+            print("saving to "+setup.games_file+" failed at "+time.strftime("%A, %B %d, %Y at %H:%M:%S "+setup.timezone, time.localtime(now)))
+        try:
+            with open(setup.history_file, "w") as f:
+                json.dump(bot.games, f)
+        except Exception:
+            print("saving to "+setup.history_file+" failed at "+time.strftime("%A, %B %d, %Y at %H:%M:%S "+setup.timezone, time.localtime(now)))
+        try:
+            with open(setup.profiles_file, "w") as f:
+                json.dump(bot.games, f)
+        except Exception:
+            print("saving to "+setup.profiles_file+" failed at "+time.strftime("%A, %B %d, %Y at %H:%M:%S "+setup.timezone, time.localtime(now)))
+    except Exception as e:
+        traceback.print_exception(type(e), e, e.__traceback__)
+    finally:
+        lock.release()
 
-@bot.command(pass_context=True)
-async def move(context): ####################################################################################################################################
+# mainline commands below
+
+@bot.command(aliases=[])
+async def commands(ctx, *args): # this code can probably be optimized/refactored, but it is not a priority because it is future proof
     try:
-        err = "insufficient arguments to command"
-        if len(context.message.content.split()) != 3:
-            raise Exception
-        game_id = context.message.content.split()[1]
-        err = "this game is already over"
-        if game_id in bot.history.keys():
-            raise Exception
-        this_board = chess.Board()
-        err = "game ID not found"
-        game = chess.pgn.read_game(io.StringIO(bot.games[game_id]))
-        for move in game.mainline_moves():
-            this_board.push(move)
-        err = "you are not a player in this game"
-        if str(context.message.author.id) != game.headers["White"] and str(context.message.author.id) != game.headers["Black"]:
-            raise Exception
-        err = "this game is already over"
-        if game.headers["Result"] != "": # not needed after history implemented
-            raise Exception
-        err = "it is not your turn"
-        if ((len(this_board.move_stack)%2 == 0 and str(context.message.author.id) == game.headers["Black"]) or (len(this_board.move_stack)%2 == 1 and str(context.message.author.id) == game.headers["White"])) and (game.headers["White"] != game.headers["Black"]):
-            raise Exception
-        err = "not all players could be found"
-        conv = MemberConverter()
-        mem1 = await conv.convert(context, str(context.message.author.id))
-        if str(context.message.author.id) == game.headers["White"]:
-            mem2 = await conv.convert(context, game.headers["Black"])
+        coms = sorted(list(bot.commands), key=lambda x: x.name)
+        if ctx.message.author.id != bot.owner.id:
+            new_coms = [com for com in coms if not json.loads(com.__doc__)["owner"]]
+            coms = new_coms
+        if len(args) == 0:
+            page_num = 1
         else:
-            mem2 = await conv.convert(context, game.headers["White"])
-        if context.message.content.split()[2] == "resign" or context.message.content.split()[2] == "r":
-            emb = discord.Embed(
-                    title = "move successful, game over",
-                    description = "you resigned from the game",
-                    color = discord.Color.from_rgb(0,0,255)
-                    )
-            emb.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
-            msg = board_to_string(this_board)
-            emb3 = discord.Embed(
-                                title = "game over",
-                                description = "game ID "+game_id+" ended, your opponent resigned",
-                                color = discord.Color.from_rgb(0,0,255)
-                                )
-            emb3.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
-            err = "not all players could be contacted, the move was aborted"
-            await context.message.channel.send(embed=emb)
-            await context.message.channel.send(msg)
-            if str(context.message.author.id) == game.headers["White"]:
-                game.headers["Result"] = "r-0"
-                game.headers["Move"] = "white resignation"
-            else:
-                game.headers["Result"] = "0-r"
-                game.headers["Move"] = "black resignation"
-            bot.games[game_id] = str(game) # push the changes made to the game
-            if len(this_board.move_stack) <= 8: # do not save to history if resignation in 8 moves or less!
-                del bot.games[game_id]
-            else:
-                bot.history[game_id] = bot.games[game_id]
-                del bot.games[game_id]
             try:
-                await mem2.send(embed=emb3)
-                await mem2.send(msg)
+                page_num = int(args[0])
+                if page_num > 1+((len(coms)-1)//10) or page_num < 1:
+                    raise Exception
             except Exception:
-                pass
+                await safe_send_embed(ctx.message.channel, other_embed("Error", "Invalid page number."))
+                return
+        emb = other_embed("Commands (page "+str(page_num)+"/"+str(1+((len(coms)-1)//10))+")",
+                          None, [127, 127, 127])
+        for com in coms[(page_num-1)*10:page_num*10]:
+            try:
+                doc = json.loads(com.__doc__)
+            except Exception:
+                doc = {"name": com.name, "value": "No description provided.", "owner": True}
+            emb.add_field(
+                name = bot.command_prefix+doc["name"],
+                value = (int(doc["owner"])*"__**OWNER ONLY COMMAND.**__\n")+doc["value"],
+                inline = False
+                )
+        await safe_send_embed(ctx.message.channel, emb)
+    except Exception:
+        pass # disconnected
+commands.__doc__ = json.dumps(
+    {
+        "name": "commands <page number>",
+        "value": "Displays this list of commands. Select another page with the optional <page number> argument.",
+        "owner": False
+        }
+    )
+
+@bot.command(aliases=[])
+async def invite(ctx):
+    try:
+        await safe_send_embed(ctx.message.channel, other_embed("Invite", "Use [this link]("+discord.utils.oauth_url(bot.user.id)+") to invite RoyChess to other servers.", [127, 127, 127]))
+    except Exception:
+        pass
+invite.__doc__ = json.dumps(
+    {
+        "name": "invite",
+        "value": "Shares the invite link to add RoyChess to other servers.",
+        "owner": False
+        }
+    )
+
+@bot.command(aliases=[])
+async def create_game(ctx, *args):
+    await lock.acquire()
+    try:
+        if len(args) != 1:
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "This command requires 1 argument: A player ID or mention of who you are starting a game with."))
             return
-        else:
-            err = "invalid UCI string "+context.message.content.split()[2]
-            move = chess.Move.from_uci(context.message.content.split()[2])
-        if move not in this_board.legal_moves:
-            err = "invalid move "+context.message.content.split()[2]
-            raise Exception
-        this_board.push(move)
-        if this_board.is_game_over():
-            res = this_board.result().split("-")
-            if res[0] == "1/2":
-                emb = discord.Embed(
-                                    title = "move successful, game over",
-                                    description = "the move "+context.message.content.split()[2]+" was made successfully and ended the game in a draw or stalemate",
-                                    color = discord.Color.from_rgb(0,0,255)
-                                    )
-                emb.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
-                emb3 = discord.Embed(
-                                    title = "game over",
-                                    description = "game ID "+game_id+" ended in a draw or stalemate",
-                                    color = discord.Color.from_rgb(0,0,255)
-                                    )
-                emb3.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
-            else:
-                emb = discord.Embed(
-                                    title = "move successful, game over",
-                                    description = "the move "+context.message.content.split()[2]+" was made successfully and won you the game",
-                                    color = discord.Color.from_rgb(0,0,255)
-                                    )
-                emb.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
-                emb3 = discord.Embed(
-                                    title = "game over",
-                                    description = "game ID "+game_id+" ended in a loss for you",
-                                    color = discord.Color.from_rgb(0,0,255)
-                                    )
-                emb3.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
-        else:
-            emb = discord.Embed(
-                                title = "move successful",
-                                description = "the move "+context.message.content.split()[2]+" was made successfully",
-                                color = discord.Color.from_rgb(0,255,0)
-                                )
-            emb.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
-            if this_board.is_check():
-                emb3 = discord.Embed(
-                                    title = "your turn",
-                                    description = "it is your turn to play the board with game ID "+game_id+", you are in check",
-                                    color = discord.Color.from_rgb(0,255,0)
-                                    )
-            else:
-                emb3 = discord.Embed(
-                                    title = "your turn",
-                                    description = "it is your turn to play the board with game ID "+game_id,
-                                    color = discord.Color.from_rgb(0,255,0)
-                                    )
-            emb3.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
-        msg = board_to_string(this_board)
-        err = "not all players could be contacted, the move was aborted"
-        await context.message.channel.send(embed=emb)
-        await context.message.channel.send(msg)
-        await mem2.send(embed=emb3)
-        await mem2.send(msg)
-        game.headers["Move"] = context.message.content.split()[2]
-        new_game = chess.pgn.Game().from_board(this_board)
+        mem1 = ctx.message.author # may not be discord.Member, potentially discord.User
+        conv = MemberConverter() # need to instantiate new object, otherwise convert can't pass in self
+        try:
+            mem2 = await conv.convert(ctx, args[0]) # much cleaner than before, and much more native
+        except Exception:
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "Player not found, make sure RoyChess shares a server with the other player."))
+            return
+        # enable game with self temporarily for testing
+        """
+        if mem1.id == mem2.id:
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "You cannot play a game against yourself."))
+            return
+        """
+        if mem1.bot or mem2.bot:
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "Bots cannot participate in games."))
+            return
+        for i in bot.games:
+            game = chess.pgn.read_game(io.StringIO(bot.games[i]))
+            if (str(mem1.id) == game.headers["White"] and str(mem2.id) == game.headers["Black"]) or (str(mem1.id) == game.headers["Black"] and str(mem2.id) == game.headers["White"]):
+                await safe_send_embed(ctx.message.channel, other_embed("Error", "A game with this player already exists with game ID "+str(i)+"."))
+                return
+        game_id = "1" if len(bot.games) == 0 and len(bot.history) == 0 else str(1 + max([int(x) for x in bot.games] + [int(x) for x in bot.history]))
+        # note: a O(n) operation every time a game is created is bad, refactor this
+        timestamp = int(time.time())
+        emb1 = other_embed("Game Invitation Received", None, [0, 0, 255])
+        emb1.add_field(
+                       name = "Game ID",
+                       value = game_id,
+                       inline = True
+                      )
+        emb1.add_field(
+                       name = "White",
+                       value = str(mem1),
+                       inline = True
+                      )
+        emb1.add_field(
+                       name = "Black",
+                       value = str(mem2),
+                       inline = True
+                      )
+        emb1.add_field(
+                       name = "Invitation Timestamp",
+                       value = time.strftime("%A, %B %d, %Y at %H:%M:%S "+setup.timezone, time.localtime(timestamp)),
+                       inline = True
+                      )
+        emb1.add_field(
+                       name = "Invitation Status",
+                       value = "Pending",
+                       inline = True
+                      )
+        emb1.add_field(
+                       name = "Invitation Help",
+                       value = ("You can accept this game invitation with the "
+                       "\""+bot.command_prefix+"accept_invite "+game_id+"\" command "
+                       "or decline this game invitation with the "
+                       "\""+bot.command_prefix+"decline_invite "+game_id+"\" command. "),
+                       inline = True
+                      )
+        if await safe_send_embed(mem2, emb1) < 0:
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "Player could not be contacted."))
+            return
+        emb2 = other_embed("Game Invitation Sent", None, [0, 255, 0])
+        emb2.add_field(
+                       name = "Game ID",
+                       value = game_id,
+                       inline = True
+                      )
+        emb2.add_field(
+                       name = "White",
+                       value = str(mem1),
+                       inline = True
+                      )
+        emb2.add_field(
+                       name = "Black",
+                       value = str(mem2),
+                       inline = True
+                      )
+        emb2.add_field(
+                       name = "Invitation Timestamp",
+                       value = time.strftime("%A, %B %d, %Y at %H:%M:%S "+setup.timezone, time.localtime(timestamp)),
+                       inline = True
+                      )
+        emb2.add_field(
+                       name = "Invitation Status",
+                       value = "Pending",
+                       inline = True
+                      )
+        emb2.add_field(
+                       name = "Invitation Help",
+                       value = ("You can revoke this game invitation with the "
+                       "\""+bot.command_prefix+"revoke_invite "+game_id+"\" command."),
+                       inline = True
+                      )
+        await safe_send_embed(ctx.message.channel, emb2) # if this fails, follow through with settuping up because the other player was already notified
+        bot.games[game_id] = str(new_game(str(mem1.id), str(mem2.id), str(timestamp)))
+    except Exception as e:
+        await safe_send_embed(ctx.message.channel, error_embed(e))
+    finally:
+        lock.release()
+create_game.__doc__ = json.dumps(
+    {
+        "name": "create_game <username, user ID, or mention>",
+        "value": "Sends an invite for a new game between the user that called the command and the user specified.",
+        "owner": False
+        }
+    )
+
+@bot.command(aliases=[])
+async def accept_invite(ctx, *args):
+    await lock.acquire()
+    try:
+        if len(args) != 1:
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "This command requires 1 argument: A game ID."))
+            return
+        mem2 = ctx.message.author # may not be discord.Member, potentially discord.User
+        game_id = args[0]
+        if game_id not in bot.games:
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "A game with the specified ID does not exist."))
+            return
+        game = chess.pgn.read_game(io.StringIO(bot.games[game_id]))
+        if str(mem2.id) != game.headers["Black"]:
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "You were not invited to play that game."))
+            return
+        if game.headers["Started"] == "True":
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "You have already accepted the invitation to play this game."))
+            return
+        conv = MemberConverter() # need to instantiate new object, otherwise convert can't pass in self
+        try:
+            mem1 = await conv.convert(ctx, game.headers["White"])
+        except Exception:
+            mem1 = None
+        last_timestamp = int(time.time())
+        emb = other_embed("Game Invitation Accepted", None, [255, 255, 255])
+        emb.add_field(
+                      name = "Game ID",
+                      value = game_id,
+                      inline = True
+                      )
+        emb.add_field(
+                      name = "White",
+                      value = str(mem1),
+                      inline = True
+                      )
+        emb.add_field(
+                      name = "Black",
+                      value = str(mem2),
+                      inline = True
+                      )
+        emb.add_field(
+                      name = "Invitation Timestamp",
+                      value = time.strftime("%A, %B %d, %Y at %H:%M:%S "+setup.timezone, time.localtime(int(game.headers["First_Timestamp"]))),
+                      inline = True
+                      )
+        emb.add_field(
+                      name = "Recent Timestamp",
+                      value = time.strftime("%A, %B %d, %Y at %H:%M:%S "+setup.timezone, time.localtime(last_timestamp)),
+                      inline = True
+                      )
+        emb.add_field(
+                      name = "Turn",
+                      value = "White ("+str(mem1)+")",
+                      inline = True
+                      )
+        emb.add_field(
+                      name = "Moves",
+                      value = "0",
+                      inline = True
+                     )
+        emb.add_field(
+                      name = "Last Move",
+                      value = game.headers["Move"],
+                      inline = True
+                     )
+        emb.add_field(
+                      name = "Game Conclusion",
+                      value = {"" : "Still in Progress", "1-0" : "White Victory", "0-1" : "Black Victory", "1/2-1/2" : "Draw or Stalemate", "r-0" : "White Resignation", "0-r" : "Black Resignation"}[game.headers["Result"]],
+                      inline = True
+                     )
+        b = board_to_string(game.board())
+        await safe_send_embed(mem1, emb, b)
+        await safe_send_embed(ctx.message.channel, emb, b)
+        game.headers["Last_Timestamp"] = str(last_timestamp)
+        game.headers["Started"] = "True"
+        bot.games[game_id] = str(game)
+    except Exception as e:
+        await safe_send_embed(ctx.message.channel, error_embed(e))
+    finally:
+        lock.release()
+accept_invite.__doc__ = json.dumps(
+    {
+        "name": "accept_invite <game ID>",
+        "value": "Accepts an invitation to a game.",
+        "owner": False
+        }
+    )
+
+@bot.command(aliases=[])
+async def decline_invite(ctx, *args):
+    await lock.acquire()
+    try:
+        if len(args) != 1:
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "This command requires 1 argument: A game ID."))
+            return
+        mem2 = ctx.message.author # may not be discord.Member, potentially discord.User
+        game_id = args[0]
+        if game_id not in bot.games:
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "A game with the specified ID does not exist."))
+            return
+        game = chess.pgn.read_game(io.StringIO(bot.games[game_id]))
+        if str(mem2.id) != game.headers["Black"]:
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "You were not invited to play that game."))
+            return
+        if game.headers["Started"] != "False":
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "You have already accepted the invitation to play this game."))
+            return
+        conv = MemberConverter() # need to instantiate new object, otherwise convert can't pass in self
+        try:
+            mem1 = await conv.convert(ctx, game.headers["White"])
+        except Exception:
+            mem1 = None
+        last_timestamp = int(time.time())
+        emb = other_embed("Game Invitation Declined", None, [127, 0, 255])
+        emb.add_field(
+                      name = "Game ID",
+                      value = game_id,
+                      inline = True
+                      )
+        emb.add_field(
+                      name = "White",
+                      value = str(mem1),
+                      inline = True
+                      )
+        emb.add_field(
+                      name = "Black",
+                      value = str(mem2),
+                      inline = True
+                      )
+        emb.add_field(
+                      name = "Invitation Timestamp",
+                      value = time.strftime("%A, %B %d, %Y at %H:%M:%S "+setup.timezone, time.localtime(int(game.headers["First_Timestamp"]))),
+                      inline = True
+                      )
+        emb.add_field(
+                      name = "Recent Timestamp",
+                      value = time.strftime("%A, %B %d, %Y at %H:%M:%S "+setup.timezone, time.localtime(last_timestamp)),
+                      inline = True
+                      )
+        await safe_send_embed(mem1, emb)
+        await safe_send_embed(ctx.message.channel, emb)
+        del bot.games[game_id]
+    except Exception as e:
+        await safe_send_embed(ctx.message.channel, error_embed(e))
+    finally:
+        lock.release()
+decline_invite.__doc__ = json.dumps(
+    {
+        "name": "decline_invite <game ID>",
+        "value": "Declines an invitation to a game.",
+        "owner": False
+        }
+    )
+
+@bot.command(aliases=[])
+async def revoke_invite(ctx, *args):
+    await lock.acquire()
+    try:
+        if len(args) != 1:
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "This command requires 1 argument: A game ID."))
+            return
+        mem1 = ctx.message.author # may not be discord.Member, potentially discord.User
+        game_id = args[0]
+        if game_id not in bot.games:
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "A game with the specified ID does not exist."))
+            return
+        game = chess.pgn.read_game(io.StringIO(bot.games[game_id]))
+        if str(mem1.id) != game.headers["White"]:
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "You were not invited to play that game."))
+            return
+        if game.headers["Started"] != "False":
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "You have already accepted the invitation to play this game."))
+            return
+        conv = MemberConverter() # need to instantiate new object, otherwise convert can't pass in self
+        try:
+            mem2 = await conv.convert(ctx, game.headers["Black"])
+        except Exception:
+            mem2 = None
+        last_timestamp = int(time.time())
+        emb = other_embed("Game Invitation Revoked", None, [127, 0, 255])
+        emb.add_field(
+                      name = "Game ID",
+                      value = game_id,
+                      inline = True
+                      )
+        emb.add_field(
+                      name = "White",
+                      value = str(mem1),
+                      inline = True
+                      )
+        emb.add_field(
+                      name = "Black",
+                      value = str(mem2),
+                      inline = True
+                      )
+        emb.add_field(
+                      name = "Invitation Timestamp",
+                      value = time.strftime("%A, %B %d, %Y at %H:%M:%S "+setup.timezone, time.localtime(int(game.headers["First_Timestamp"]))),
+                      inline = True
+                      )
+        emb.add_field(
+                      name = "Recent Timestamp",
+                      value = time.strftime("%A, %B %d, %Y at %H:%M:%S "+setup.timezone, time.localtime(last_timestamp)),
+                      inline = True
+                      )
+        await safe_send_embed(mem2, emb)
+        await safe_send_embed(ctx.message.channel, emb)
+        del bot.games[game_id]
+    except Exception as e:
+        await safe_send_embed(ctx.message.channel, error_embed(e))
+    finally:
+        lock.release()
+revoke_invite.__doc__ = json.dumps(
+    {
+        "name": "revoke_invite <game ID>",
+        "value": "Revokes an invitation to a game.",
+        "owner": False
+        }
+    )
+
+@bot.command(aliases=[])
+async def move(ctx, *args):
+    await lock.acquire()
+    try:
+        if len(args) != 2:
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "This command requires 2 arguments: A game ID and a UCI string."))
+            return
+        game_id = args[0]
+        uci_move = args[1]
+        if game_id not in bot.games and game_id not in bot.history:
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "This game does not exist or was timed out."))
+            return
+        if game_id not in bot.games:
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "This game has already concluded."))
+            return
+        game = chess.pgn.read_game(io.StringIO(bot.games[game_id]))
+        board = chess.Board()
+        for move in game.mainline_moves():
+            board.push(move)
+        if str(ctx.message.author.id) != game.headers["White"] and str(ctx.message.author.id) != game.headers["Black"]:
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "You are not a player in this game."))
+            return
+        if game.headers["Started"] == "False":
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "The game invitation has not been accepted yet."))
+            return
+        if (len(board.move_stack)%2 == 0 and str(ctx.message.author.id) != game.headers["White"]) or (len(board.move_stack)%2 == 1 and str(ctx.message.author.id) != game.headers["Black"]):
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "It is not your turn to play in this game."))
+            return
+        last_timestamp = int(time.time())
+        try:
+            move = chess.Move.from_uci(uci_move)
+        except Exception:
+            if uci_move not in ["resign", "forfeit", "quit", "r", "f", "q"]:
+                await safe_send_embed(ctx.message.channel, other_embed("Error", "Invalid UCI string."))
+                return
+            if len(board.move_stack) >= setup.min_move_cutoff:
+                game.headers["Last_Timestamp"] = str(last_timestamp)
+                if str(ctx.message.author.id) == game.headers["White"]:
+                    game.headers["Result"] = "r-0"
+                    game.headers["Move"] = "White Resignation"
+                else:
+                    game.headers["Result"] = "0-r"
+                    game.headers["Move"] = "Black Resignation"
+                bot.history[game_id] = str(game)
+            del bot.games[game_id]
+            emb1 = other_embed("Move Successful, Game Over", "You resigned from the game.", [127, 0, 255])
+            emb2 = other_embed("Game Over, You Win", "Game ID "+game_id+" ended, your opponent resigned.", [127, 0, 255])
+            b = board_to_string(board)
+            await safe_send_embed(ctx.message.channel, emb1, b) # it doesn't matter if this send fails
+            conv = MemberConverter()
+            try:
+                mem = await conv.convert(ctx, game.headers["Black"] if str(ctx.message.author.id) == game.headers["White"] else game.headers["White"])
+                await safe_send_embed(mem, emb2, b)
+            except Exception:
+                pass # resignation is still possible even if other member can't be found
+            return
+        if move not in board.legal_moves:
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "Invalid move."))
+            return
+        conv = MemberConverter() # making a move is not possible if other member can't be found
+        try:
+            mem = await conv.convert(ctx, game.headers["Black"] if str(ctx.message.author.id) == game.headers["White"] else game.headers["White"])
+        except Exception:
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "Other player could not be found."))
+            return
+        board.push(move) # make the move
+        b = board_to_string(board)
+        if "1/2" in board.result(): # draw
+            emb1 = other_embed("Move Successful, Game Over", "The move "+uci_move+" was made successfully and ended the game in a draw or stalemate.", [127, 0, 255])
+            emb2 = other_embed("Game Over", "Game ID "+game_id+" ended in a draw or stalemate.", [127, 0, 255])
+        elif board.result() != "*": # player who moved won
+            emb1 = other_embed("Move Successful, Game Over", "The move "+uci_move+" was made successfully and won you the game.", [127, 0, 255])
+            emb2 = other_embed("Game Over", "Game ID "+game_id+" ended in a loss for you.", [127, 0, 255])
+        else: # game still going
+            emb1 = other_embed("Move Successful", "The move "+uci_move+" was made successfully.", [0, 255, 0])
+            emb2 = other_embed("Your Turn", "It is your turn to play the board with game ID "+game_id+{True: ", you are in check.", False: "."}[board.is_check()], [0, 255, 0])
+        if await safe_send_embed(mem, emb2, b) < 0:
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "Player could not be contacted."))
+            return # making a move is impossible if bot can't find other user
+        await safe_send_embed(ctx.message.channel, emb1, b)
+        new_game = chess.pgn.Game().from_board(board)
         new_game.headers = game.headers
+        new_game.headers["Move"] = uci_move
+        new_game.headers["Last_Timestamp"] = str(last_timestamp)
         bot.games[game_id] = str(new_game)
-        if this_board.is_game_over():
-            new_game.headers["Result"] = this_board.result()
+        if board.is_game_over():
+            new_game.headers["Result"] = board.result()
             bot.history[game_id] = str(new_game)
             del bot.games[game_id]
-    except Exception:
-        try:
-            await context.message.channel.send(embed=error_embed(bot, "error making move", err))
-        except Exception:
-            pass
-    return
+    except Exception as e:
+        await safe_send_embed(ctx.message.channel, error_embed(e))
+    finally:
+        lock.release()
+move.__doc__ = json.dumps(
+    {
+        "name": "move <game ID> <UCI string or resignation string>",
+        "value": "Make a move in a chess game, only [long algebraic notation](https://en.wikipedia.org/wiki/Algebraic_notation_(chess)#Long_algebraic_notation) moves are valid [UCI strings](https://en.wikipedia.org/wiki/Universal_Chess_Interface). You can also forfeit using any of the following UCI strings: resign, forfeit, quit, r, f, or q.",
+        "owner": False
+        }
+    )
 
-@bot.command(pass_context=True)
-async def info(context): ####################################################################################################################################
-    emb = discord.Embed(
-                        title = "RoyChess information",
-                        color = discord.Color.from_rgb(127,127,127)
-                        )
+@bot.command(aliases=[])
+async def board(ctx, *args):
+    await lock.acquire()
+    try:
+        if len(args) != 1:
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "This command requires 1 argument: A game ID."))
+            return
+        game_id = args[0]
+        if game_id not in bot.games and game_id not in bot.history:
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "This game does not exist or was timed out."))
+            return
+        game = chess.pgn.read_game(io.StringIO(bot.games[game_id] if game_id in bot.games else bot.history[game_id]))
+        conv = MemberConverter()
+        try:
+            mem1 = await conv.convert(ctx, game.headers["White"])
+            mem2 = await conv.convert(ctx, game.headers["Black"])
+        except Exception:
+            await safe_send_embed(ctx.message.channel, other_embed("Error", "Not all players could be found."))
+            return
+        board = chess.Board()
+        for move in game.mainline_moves():
+            board.push(move)
+        b = board_to_string(board)
+        if game.headers["Started"] == "False": # replace with a ternary expression!
+            cl = [0, 0, 255]
+        elif game.headers["Result"] == "":
+            cl = 3*[255*(1-(len(board.move_stack)%2))]
+        else:
+            cl = [127, 0, 255]
+        emb = other_embed("View Board", None, cl)
+        emb.add_field(
+                      name = "Game ID",
+                      value = game_id,
+                      inline = True
+                     )
+        emb.add_field(
+                      name = "White",
+                      value = str(mem1),
+                      inline = True
+                     )
+        emb.add_field(
+                      name = "Black",
+                      value = str(mem2),
+                      inline = True
+                     )
+        emb.add_field(
+                      name = "Invitation Timestamp",
+                      value = time.strftime("%A, %B %d, %Y at %H:%M:%S "+setup.timezone, time.localtime(int(game.headers["First_Timestamp"]))),
+                      inline = True
+                     )
+        if game.headers["Started"] == "False":
+            emb.add_field(
+                          name = "Invitation Status",
+                          value = "Pending",
+                          inline = True
+                         )
+        else:
+            emb.add_field(
+                          name = "Recent Timestamp",
+                          value = time.strftime("%A, %B %d, %Y at %H:%M:%S "+setup.timezone, time.localtime(int(game.headers["Last_Timestamp"]))),
+                          inline = True
+                         )
+            emb.add_field(
+                          name = "Turn",
+                          value = {0: "White ("+str(mem1)+")", 1: "Black ("+str(mem2)+")"}[len(board.move_stack)%2],
+                          inline = True
+                         )
+            emb.add_field(
+                          name = "Moves",
+                          value = str(len(board.move_stack)),
+                          inline = True
+                         )
+            emb.add_field(
+                          name = "Last Move",
+                          value = game.headers["Move"],
+                          inline = True
+                         )
+            emb.add_field(
+                          name = "Game Conclusion",
+                          value = {"" : "Still in Progress", "1-0" : "White Victory", "0-1" : "Black Victory", "1/2-1/2" : "Draw or Stalemate", "r-0" : "White Resignation", "0-r" : "Black Resignation"}[game.headers["Result"]],
+                          inline = False
+                         )
+        await safe_send_embed(ctx.message.channel, emb, b)
+    except Exception as e:
+        await safe_send_embed(ctx.message.channel, error_embed(e))
+    finally:
+        lock.release()
+board.__doc__ = json.dumps(
+    {
+        "name": "board <game ID>",
+        "value": "View the current board of a specific game.",
+        "owner": False
+        }
+    )
+
+@bot.command(aliases=[])
+async def info(ctx):
+    emb = other_embed("RoyChess information", None, [255, 255, 0])
     emb.add_field(
-                  name = "bot version:",
-                  value = "3", # increment by 1 when pushing a new release
+                  name = "Version",
+                  value = "1.00", 
                   inline = True
                  )
+    # increment by 1.00 for major feature additions,
+    # increment by 0.01 for minor cleanup.
     emb.add_field(
-                  name = "server count:",
+                  name = "Servers",
                   value = len(bot.guilds),
                   inline = True
                  )
     emb.add_field(
-                  name = "games in progress:",
+                  name = "Games in Progress",
                   value = len(bot.games),
                   inline = True
                  )
     emb.add_field(
-                  name = "games completed:",
+                  name = "Games Completed",
                   value = len(bot.history),
                   inline = True
                  )
+    # not implemented yet
+    """
     emb.add_field(
-                  name = "user profiles:",
+                  name = "User Profiles:",
                   value = len(bot.profiles),
                   inline = True
                  )
+    """
     emb.add_field(
-                  name = "command prefix:",
-                  value = prefix,
+                  name = "Command Prefix",
+                  value = bot.command_prefix,
                   inline = True
                  )
     emb.add_field(
-                  name = "help command:",
-                  value = prefix+"commands",
+                  name = "Help Command",
+                  value = bot.command_prefix+"commands", # we might need an actual help command
                   inline = True
                  )
     emb.add_field(
-                  name = "official RoyChess server:",
-                  value = "[link](https://discord.gg/Cj5dmCe)",
+                  name = "Official RoyChess Server",
+                  value = "[link]("+setup.home_invite+")",
                   inline = True
                  )
-    emb.set_thumbnail(url=bot.user.avatar_url)
-    emb.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
+    devs = ""
+    if len(setup.developers) == 1:
+        devs += setup.developers[0]
+    elif len(setup.developers) == 2:
+        devs += setup.developers[0] + " and " + setup.developers[1]
+    elif len(setup.developers) > 2:
+        for i, dev in enumerate(setup.developers):
+            if i != len(setup.developers)-1:
+                devs += dev + ", "
+            else:
+                devs += "and " + dev
+    emb.add_field(
+                  name = "Bot Developers",
+                  value = devs,
+                  inline = True
+                 )
+    emb.add_field(
+                  name = "Bot Owner",
+                  value = str(bot.owner),
+                  inline = True
+                 )
+    await safe_send_embed(ctx.message.channel, emb)
+info.__doc__ = json.dumps(
+    {
+        "name": "info",
+        "value": "Displays general information about the bot.",
+        "owner": False
+        }
+    )
+
+# testing, owner only, or unrelated commands below
+
+@bot.command(aliases=[])
+@cmds.is_owner()
+async def shutdown(ctx, *args):
+    await lock.acquire()
     try:
-        await context.message.channel.send(embed=emb)
+        await safe_send_embed(ctx.message.channel, other_embed("Shutdown", "Acquiring locks, saving data, and shutting down.", [0,0,0]))
+        await bot.change_presence(status=discord.Status.invisible, activity=discord.Game(name=""))
     except Exception:
-        pass
-    return
+        pass # disconnect
+    finally:
+        lock.release()
+        await bot.logout()
+shutdown.__doc__ = json.dumps(
+    {
+        "name": "shutdown",
+        "value": "Forces the bot to acquire all locks, save data to disk, and logs out.",
+        "owner": True
+        }
+    )
 
-@bot.command(pass_context=True)
-async def force_save(context): ####################################################################################################################################
-    if context.message.author.id == bot.me.id:
-        try:
-            if bot.saving:
-                raise Exception
-            emb = discord.Embed(
-                                title = "saved games",
-                                description = "saved all games to games.json",
-                                color = discord.Color.from_rgb(0,255,0)
-                                )
-            emb.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
-            bot.saving = True
-            f = open("games.json", "w")
-            json.dump(bot.games, f)
-            f.close()
-            f = open("history.json", "w")
-            json.dump(bot.history, f)
-            f.close()
-            bot.saving = False
-            try:
-                await context.message.channel.send(embed=emb)
-            except Exception:
-                pass
-        except Exception:
-            emb = discord.Embed(
-                                title = "saving error",
-                                description = "interrupted while saving",
-                                color = discord.Color.from_rgb(255,0,0)
-                                )
-            emb.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
-            try:
-                await context.message.channel.send(embed=emb)
-            except Exception:
-                pass
-    else:
-        emb = discord.Embed(
-                            title = "command error",
-                            description = "command does not exist",
-                            color = discord.Color.from_rgb(255,0,0)
-                            )
-        emb.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
-        try:
-            await context.message.channel.send(embed=emb)
-        except Exception:
-            pass
-        return
+@bot.command(aliases=[])
+@cmds.is_owner()
+async def test(ctx, *args):
+    await lock.acquire()
+    try:
+        await safe_send_embed(ctx.message.channel, other_embed("Game", bot.games[args[0]], [0, 255, 0]))
+    except Exception as e:
+        await safe_send_embed(ctx.message.channel, error_embed(e))
+    finally:
+        lock.release()
+test.__doc__ = json.dumps(
+    {
+        "name": "test",
+        "value": "Just for personal testing.",
+        "owner": True
+        }
+    )
 
-@bot.command(pass_context=True)
-async def force_delete(context): ####################################################################################################################################
-    if context.message.author.id == bot.me.id:
-        try:
-            if bot.saving:
-                raise Exception
-            emb = discord.Embed(
-                                title = "deleted games",
-                                description = "deleted all games being played from games.json",
-                                color = discord.Color.from_rgb(0,255,0)
-                                )
-            emb.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
-            bot.games = {}
-            bot.history = {}
-            bot.saving = True
-            f = open("games.json", "w")
-            json.dump(bot.games, f)
-            f.close()
-            f = open("history.json", "w")
-            json.dump(bot.history, f)
-            f.close()
-            bot.saving = False
-            try:
-                await context.message.channel.send(embed=emb)
-            except Exception:
-                pass
-        except Exception:
-            emb = discord.Embed(
-                                title = "deleting error",
-                                description = "interrupted while saving",
-                                color = discord.Color.from_rgb(255,0,0)
-                                )
-            emb.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
-            try:
-                await context.message.channel.send(embed=emb)
-            except Exception:
-                pass
-    else:
-        emb = discord.Embed(
-                            title = "command error",
-                            description = "command does not exist",
-                            color = discord.Color.from_rgb(255,0,0)
-                            )
-        emb.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
-        try:
-            await context.message.channel.send(embed=emb)
-        except Exception:
-            pass
-        return
+# typical cleanup below
 
 @bot.event
-async def on_command_error(context, error): ####################################################################################################################################
-    if isinstance(error, CommandNotFound):
-        emb = discord.Embed(
-                            title = "command error",
-                            description = "command does not exist",
-                            color = discord.Color.from_rgb(255,0,0)
-                            )
-        emb.set_footer(text=str(bot.me), icon_url=bot.me.avatar_url)
+async def on_disconnect():
+    await lock.acquire() # the lock always releases, even if internet goes down
+    try:
         try:
-            await context.message.channel.send(embed=emb)
+            with open(setup.games_file, "w") as f:
+                json.dump(bot.games, f)
+            print("games saved to file")
         except Exception:
-            pass
-        return
-    raise error
+            print("games failed to save to file")
+            # don't raise exception, otherwise all saving will terminate
+        try:
+            with open(setup.history_file, "w") as f:
+                json.dump(bot.history, f)
+            print("history saved to file")
+        except Exception:
+            print("history failed to save to file")
+        try:
+            with open(setup.profiles_file, "w") as f:
+                json.dump(bot.profiles, f)
+            print("profiles saved to file")
+        except Exception:
+            print("profiles failed to save to file")
+    except Exception:
+        pass # everything is wrapped in try-catch anyway
+    finally:
+        lock.release()
 
-bot.remove_command("help")
-bot.run(token)
+@bot.event
+async def on_command_error(ctx, e):
+    if isinstance(e, CommandNotFound):
+        await safe_send_embed(ctx.message.channel, other_embed("Error", "Command \""+str(discord.utils.escape_markdown(ctx.message.content.split()[0]))+"\" does not exist"))
+        return
+    raise e
+
+# running code below
+
+try:
+    bot.run(setup.token)
+except Exception as e:
+    traceback.print_exception(type(e), e, e.__traceback__)
+
+        
